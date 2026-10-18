@@ -1,0 +1,104 @@
+name: Update Taiwan holidays
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SCAN_BRANCH: main
+  PR_BRANCH: ${{ vars.TAIWAN_PR_BRANCH || 'automation/update-taiwan-holidays' }}
+
+concurrency:
+  group: taiwan-holidays-main
+  cancel-in-progress: false
+
+jobs:
+  validate-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest discover -s scripts/tests -v
+
+  update:
+    needs: validate-script
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: source
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check branch configuration
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          if [[ "$SCAN_BRANCH" == "$PR_BRANCH" ]]; then
+            echo '::error::TAIWAN_SCAN_BRANCH and TAIWAN_PR_BRANCH must be different.'
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SCAN_BRANCH }}
+          path: source
+      - name: Checkout updater separately
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: updater
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Download and validate DGPA calendars
+        run: |
+          if [[ ! -f src/Nager.Date/HolidayProviders/TaiwanHolidayProvider.cs ]]; then
+            echo '::error::Merge the initial Taiwan holiday provider PR into main before updating its calendar.'
+            exit 1
+          fi
+          python3 ../updater/scripts/update_taiwan_holidays.py --output src/Nager.Date/HolidayProviders/TaiwanHolidayProvider.cs
+      - name: Check for holiday changes
+        id: changes
+        shell: bash
+        run: |
+          # Include a newly generated calendar in the diff on the first run.
+          git add --intent-to-add -- src/Nager.Date/HolidayProviders/TaiwanHolidayProvider.cs
+          if git diff --quiet -- src/Nager.Date/HolidayProviders/TaiwanHolidayProvider.cs; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'No Taiwan holiday updates found.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-dotnet@v6
+        if: steps.changes.outputs.changed == 'true'
+        with:
+          dotnet-version: 10.0.x
+      # GITHUB_TOKEN-created PRs do not trigger the normal PR build workflow.
+      - name: Build and test before opening a PR
+        if: steps.changes.outputs.changed == 'true'
+        working-directory: source/src
+        run: dotnet test --configuration Release --verbosity normal
+      - name: Create or update holiday PR
+        if: steps.changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          path: source
+          base: ${{ env.SCAN_BRANCH }}
+          branch: ${{ env.PR_BRANCH }}
+          delete-branch: true
+          add-paths: src/Nager.Date/HolidayProviders/TaiwanHolidayProvider.cs
+          commit-message: 'Update Taiwan holidays from DGPA'
+          title: 'Update Taiwan holidays from DGPA'
+          body: |
+            Refresh Taiwan government administrative office holidays from
+            [DGPA dataset 14718](https://data.gov.tw/dataset/14718).
+
+            Calendar completeness, translations, and .NET tests were checked
+            before creating this PR. Please review the published calendar changes.
